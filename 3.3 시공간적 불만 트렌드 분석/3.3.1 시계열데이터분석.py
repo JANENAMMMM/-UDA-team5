@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -39,6 +40,13 @@ try:
     LOTTIE_AVAILABLE = True
 except ImportError:
     LOTTIE_AVAILABLE = False
+
+try:
+    import geopandas as gpd
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
+    st.warning("geopandas가 설치되지 않았습니다. 공간분석 기능을 사용하려면 pip install geopandas를 실행하세요.")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = BASE_DIR / "df_final.csv"
@@ -407,6 +415,84 @@ def compute_cumulative(monthly: pd.DataFrame) -> pd.DataFrame:
         cumulative.groupby("date")["cumulative_count"].transform(lambda x: x / x.sum() * 100)
     ).round(2)
     return cumulative
+
+
+@st.cache_data
+def load_seoul_geojson() -> gpd.GeoDataFrame:
+    """서울 자치구 GeoJSON 로드."""
+    if not GEOPANDAS_AVAILABLE:
+        return None
+    
+    geo_path = BASE_DIR / "reference" / "3_서울시_자치구.geojson"
+    if not geo_path.exists():
+        return None
+    
+    try:
+        gdf = gpd.read_file(geo_path)
+        if gdf.crs is None:
+            gdf.set_crs(epsg=4326, inplace=True)
+        elif gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs(epsg=4326)
+        gdf["region_label"] = "서울" + gdf["SIG_KOR_NM"].str.replace(" ", "", regex=False)
+        return gdf
+    except Exception as e:
+        st.warning(f"GeoJSON 로드 실패: {e}")
+        return None
+
+
+@st.cache_data
+def load_population_data() -> pd.DataFrame | None:
+    """인구 데이터 로드."""
+    pop_path = BASE_DIR / "reference" / "인구밀도_20251124230406.csv"
+    if not pop_path.exists():
+        return None
+    
+    try:
+        pop_df = pd.read_csv(pop_path, header=1)
+        rename_map = {
+            pop_df.columns[0]: "level1",
+            pop_df.columns[1]: "district",
+            pop_df.columns[2]: "subdistrict",
+            pop_df.columns[3]: "population",
+        }
+        pop_df = pop_df.rename(columns=rename_map)
+        pop_df = pop_df[pop_df["subdistrict"] == "소계"]
+        pop_df = pop_df[pop_df["district"].notna() & (pop_df["district"] != "소계")]
+        pop_df["population"] = pd.to_numeric(pop_df["population"], errors="coerce")
+        pop_df = pop_df.dropna(subset=["population"])
+        pop_df["region_code"] = "서울" + pop_df["district"].str.replace(" ", "", regex=False)
+        pop_df = pop_df.groupby("region_code", as_index=False)["population"].sum()
+        return pop_df
+    except Exception as e:
+        st.warning(f"인구 데이터 로드 실패: {e}")
+        return None
+
+
+@st.cache_data
+def compute_spatial_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """공간 분석 데이터 계산."""
+    # 지역별 주제별 집계
+    spatial = (
+        df.groupby(["region", "topic"])
+        .size()
+        .reset_index(name="count")
+        .sort_values(["region", "topic"])
+    )
+    
+    # 인구 데이터 병합
+    pop_df = load_population_data()
+    if pop_df is not None:
+        spatial = spatial.merge(
+            pop_df,
+            left_on="region",
+            right_on="region_code",
+            how="left"
+        )
+        spatial["per_100k"] = (
+            spatial["count"] / spatial["population"] * 100_000
+        ).round(2)
+    
+    return spatial
 
 
 @st.cache_data
@@ -869,10 +955,10 @@ def main():
         filter_loading.empty()
     
     # 탭 구성
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📈 기본 시계열", "📊 정규화 분석", "📉 성장률 분석",
         "🗺️ 지역별 분석", "📅 시간 단위 분석", "📦 분포 분석",
-        "🔍 고급 분석", "📋 데이터 테이블"
+        "🔍 고급 분석", "🗺️ 공간 분석", "📋 데이터 테이블"
     ])
     
     # 탭 1: 기본 시계열
@@ -1813,8 +1899,153 @@ def main():
         else:
             st.warning("예측을 위해서는 최소 12개월 데이터가 필요합니다.")
     
-    # 탭 8: 데이터 테이블
+    # 탭 8: 공간 분석
     with tab8:
+        st.header("🗺️ 공간 분석")
+        st.markdown("---")
+        
+        if not GEOPANDAS_AVAILABLE:
+            st.error("공간분석을 사용하려면 geopandas를 설치해주세요: `pip install geopandas`")
+        else:
+            # 공간 분석 데이터 계산
+            with st.spinner("공간 분석 데이터 계산 중..."):
+                spatial_df = compute_spatial_analysis(df)
+                seoul_geo = load_seoul_geojson()
+            
+            if seoul_geo is None:
+                st.warning("서울 자치구 GeoJSON 파일을 찾을 수 없습니다. `reference/3_서울시_자치구.geojson` 파일이 필요합니다.")
+            else:
+                # 공간 분석 옵션
+                with st.expander("⚙️ 공간 분석 설정", expanded=False):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        spatial_metric = st.selectbox(
+                            "표시 지표",
+                            ["건수", "인구 10만명당 건수"],
+                            index=0
+                        )
+                        normalize_by_pop = spatial_metric == "인구 10만명당 건수"
+                    with col2:
+                        spatial_topic_filter = st.multiselect(
+                            "주제 필터",
+                            sorted(spatial_df["topic"].unique()) if "topic" in spatial_df.columns else [],
+                            default=sorted(spatial_df["topic"].unique())[:5] if "topic" in spatial_df.columns else []
+                        )
+                    with col3:
+                        color_scale = st.selectbox(
+                            "색상 스케일",
+                            ["Reds", "Blues", "Greens", "YlOrRd", "Viridis", "Plasma"],
+                            index=0
+                        )
+                
+                # 주제별 Choropleth 맵
+                if "topic" in spatial_df.columns and len(spatial_topic_filter) > 0:
+                    spatial_filtered = spatial_df[spatial_df["topic"].isin(spatial_topic_filter)]
+                    
+                    for topic in spatial_topic_filter:
+                        st.subheader(f"📍 {topic} - 지역별 분포")
+                        
+                        topic_data = spatial_filtered[spatial_filtered["topic"] == topic].copy()
+                        
+                        # GeoJSON과 병합
+                        merged = seoul_geo.merge(
+                            topic_data,
+                            left_on="region_label",
+                            right_on="region",
+                            how="left"
+                        )
+                        merged["count"] = merged["count"].fillna(0)
+                        if "per_100k" in merged.columns:
+                            merged["per_100k"] = merged["per_100k"].fillna(0)
+                        
+                        # Choropleth 맵 생성
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            color_col = "per_100k" if normalize_by_pop and "per_100k" in merged.columns else "count"
+                            color_label = "인구 10만명당 건수" if normalize_by_pop else "건수"
+                            
+                            try:
+                                fig = px.choropleth_mapbox(
+                                    merged,
+                                    geojson=json.loads(merged.to_json()),
+                                    locations=merged.index,
+                                    color=color_col,
+                                    hover_name="SIG_KOR_NM",
+                                    hover_data={
+                                        "count": True,
+                                        "per_100k": ":.2f" if "per_100k" in merged.columns else False,
+                                        "region_label": False
+                                    },
+                                    title=f"{topic} - 지역별 {color_label}",
+                                    color_continuous_scale=color_scale,
+                                    mapbox_style="open-street-map",
+                                    zoom=10,
+                                    center={"lat": 37.5665, "lon": 126.9780},
+                                    opacity=0.7,
+                                )
+                                fig.update_layout(
+                                    height=600,
+                                    margin=dict(l=0, r=0, t=30, b=0)
+                                )
+                                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+                            except Exception as e:
+                                # Mapbox 실패 시 일반 choropleth 사용
+                                fig = px.choropleth(
+                                    merged,
+                                    geojson=json.loads(merged.to_json()),
+                                    locations=merged.index,
+                                    color=color_col,
+                                    hover_name="SIG_KOR_NM",
+                                    hover_data={
+                                        "count": True,
+                                        "per_100k": ":.2f" if "per_100k" in merged.columns else False,
+                                    },
+                                    title=f"{topic} - 지역별 {color_label}",
+                                    color_continuous_scale=color_scale,
+                                )
+                                fig.update_geos(fitbounds="locations", visible=False)
+                                fig.update_layout(height=600)
+                                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+                        
+                        with col2:
+                            st.markdown("### 📊 통계")
+                            total_count = topic_data["count"].sum()
+                            st.metric("총 건수", f"{total_count:,}")
+                            
+                            if "per_100k" in topic_data.columns:
+                                avg_per_100k = topic_data["per_100k"].mean()
+                                st.metric("평균 (10만명당)", f"{avg_per_100k:.2f}")
+                            
+                            # 상위 지역
+                            st.markdown("### 🏆 상위 지역")
+                            top_regions = topic_data.nlargest(5, "count")[["region", "count"]]
+                            for idx, row in top_regions.iterrows():
+                                st.write(f"**{row['region']}**: {row['count']:,}건")
+                
+                # 지역별 비교 차트
+                st.subheader("지역별 비교")
+                if len(spatial_topic_filter) > 0:
+                    comparison_data = spatial_filtered.groupby("region")["count"].sum().reset_index().sort_values("count", ascending=False)
+                    
+                    fig = px.bar(
+                        comparison_data,
+                        x="region",
+                        y="count",
+                        title="지역별 총 민원 건수",
+                        labels={"count": "건수", "region": "지역"},
+                        color="count",
+                        color_continuous_scale=color_scale,
+                    )
+                    fig.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+                
+                # 데이터 테이블
+                st.subheader("공간 분석 데이터")
+                st.dataframe(spatial_filtered, use_container_width=True, height=300)
+    
+    # 탭 9: 데이터 테이블
+    with tab9:
         st.header("📋 데이터 테이블")
         
         table_option = st.selectbox(
