@@ -471,13 +471,23 @@ def load_population_data() -> pd.DataFrame | None:
 @st.cache_data
 def compute_spatial_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """공간 분석 데이터 계산."""
+    # region 정규화 (서울시 -> 서울, 공백 제거)
+    df_spatial = df.copy()
+    df_spatial["region_normalized"] = (
+        df_spatial["region"]
+        .str.replace("서울시", "서울", regex=False)
+        .str.replace("서울특별시", "서울", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+    
     # 지역별 주제별 집계
     spatial = (
-        df.groupby(["region", "topic"])
+        df_spatial.groupby(["region_normalized", "topic"])
         .size()
         .reset_index(name="count")
-        .sort_values(["region", "topic"])
+        .sort_values(["region_normalized", "topic"])
     )
+    spatial = spatial.rename(columns={"region_normalized": "region"})
     
     # 인구 데이터 병합
     pop_df = load_population_data()
@@ -491,6 +501,7 @@ def compute_spatial_analysis(df: pd.DataFrame) -> pd.DataFrame:
         spatial["per_100k"] = (
             spatial["count"] / spatial["population"] * 100_000
         ).round(2)
+        spatial = spatial.drop(columns=["region_code"], errors="ignore")
     
     return spatial
 
@@ -1947,13 +1958,33 @@ def main():
                         
                         topic_data = spatial_filtered[spatial_filtered["topic"] == topic].copy()
                         
+                        if topic_data.empty:
+                            st.warning(f"{topic} 주제에 대한 데이터가 없습니다.")
+                            continue
+                        
+                        # 지역명 정규화 (서울시 -> 서울 제거)
+                        topic_data["region_normalized"] = (
+                            topic_data["region"]
+                            .str.replace("서울시", "서울", regex=False)
+                            .str.replace("서울특별시", "서울", regex=False)
+                            .str.replace(" ", "", regex=False)
+                        )
+                        
                         # GeoJSON과 병합
                         merged = seoul_geo.merge(
                             topic_data,
                             left_on="region_label",
-                            right_on="region",
+                            right_on="region_normalized",
                             how="left"
                         )
+                        
+                        # 병합 결과 확인
+                        if merged.empty:
+                            st.warning("GeoJSON과 데이터 병합에 실패했습니다. 지역명을 확인해주세요.")
+                            st.write("사용 가능한 지역:", topic_data["region"].unique()[:5].tolist())
+                            st.write("GeoJSON 지역:", seoul_geo["region_label"].unique()[:5].tolist())
+                            continue
+                        
                         merged["count"] = merged["count"].fillna(0)
                         if "per_100k" in merged.columns:
                             merged["per_100k"] = merged["per_100k"].fillna(0)
@@ -1965,48 +1996,53 @@ def main():
                             color_col = "per_100k" if normalize_by_pop and "per_100k" in merged.columns else "count"
                             color_label = "인구 10만명당 건수" if normalize_by_pop else "건수"
                             
+                            # 일반 choropleth 사용 (더 안정적)
                             try:
-                                fig = px.choropleth_mapbox(
+                                # GeoJSON 문자열 생성
+                                geojson_str = merged.to_json()
+                                geojson_dict = json.loads(geojson_str)
+                                
+                                # SIG_KOR_NM을 locations로 사용 (GeoJSON properties와 매칭)
+                                fig = px.choropleth(
                                     merged,
-                                    geojson=json.loads(merged.to_json()),
-                                    locations=merged.index,
+                                    geojson=geojson_dict,
+                                    locations="SIG_KOR_NM",
+                                    featureidkey="properties.SIG_KOR_NM",
                                     color=color_col,
                                     hover_name="SIG_KOR_NM",
                                     hover_data={
                                         "count": True,
-                                        "per_100k": ":.2f" if "per_100k" in merged.columns else False,
+                                        "per_100k": ":.2f" if "per_100k" in merged.columns and not merged["per_100k"].isna().all() else False,
                                         "region_label": False
                                     },
                                     title=f"{topic} - 지역별 {color_label}",
                                     color_continuous_scale=color_scale,
-                                    mapbox_style="open-street-map",
-                                    zoom=10,
-                                    center={"lat": 37.5665, "lon": 126.9780},
-                                    opacity=0.7,
+                                )
+                                fig.update_geos(
+                                    fitbounds="locations",
+                                    visible=False,
+                                    projection_type="mercator"
                                 )
                                 fig.update_layout(
                                     height=600,
-                                    margin=dict(l=0, r=0, t=30, b=0)
+                                    margin=dict(l=0, r=0, t=50, b=0)
                                 )
                                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
                             except Exception as e:
-                                # Mapbox 실패 시 일반 choropleth 사용
-                                fig = px.choropleth(
-                                    merged,
-                                    geojson=json.loads(merged.to_json()),
-                                    locations=merged.index,
-                                    color=color_col,
-                                    hover_name="SIG_KOR_NM",
-                                    hover_data={
-                                        "count": True,
-                                        "per_100k": ":.2f" if "per_100k" in merged.columns else False,
-                                    },
+                                st.error(f"지도 생성 실패: {e}")
+                                # 대체: 단순 바 차트
+                                st.info("지도 대신 지역별 비교 차트를 표시합니다.")
+                                region_chart = topic_data.nlargest(10, "count")[["region", "count", "per_100k" if "per_100k" in topic_data.columns else "count"]]
+                                fig_bar = px.bar(
+                                    region_chart,
+                                    x="region",
+                                    y=color_col if color_col in region_chart.columns else "count",
                                     title=f"{topic} - 지역별 {color_label}",
+                                    color=color_col if color_col in region_chart.columns else "count",
                                     color_continuous_scale=color_scale,
                                 )
-                                fig.update_geos(fitbounds="locations", visible=False)
-                                fig.update_layout(height=600)
-                                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+                                fig_bar.update_layout(xaxis_tickangle=-45, height=400)
+                                st.plotly_chart(fig_bar, use_container_width=True, config={"displayModeBar": True})
                         
                         with col2:
                             st.markdown("### 📊 통계")
